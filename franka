@@ -1,0 +1,1677 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+# Non-sensitive defaults. Robot-specific connection settings belong in the
+# per-user config file created by `franka setup`, or in environment variables.
+DEFAULT_HOST=""
+DEFAULT_USERNAME=""
+DEFAULT_PASSWORD=""
+DEFAULT_CONTROL_TOKEN=""
+DEFAULT_TIMEOUT="30"
+DEFAULT_CONTROL_TAKE_TIMEOUT="1"
+DEFAULT_INSECURE=1
+
+CONFIG_DIR="${FRANKA_DESKAPI_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/franka-deskapi}"
+CONFIG_FILE="${FRANKA_DESKAPI_CONFIG_FILE:-${FRANKA_DESKAPI_CONFIG:-$CONFIG_DIR/config}}"
+CONFIG_HOST=""
+CONFIG_USERNAME=""
+CONFIG_PASSWORD=""
+CONFIG_TOKEN_FILE=""
+CONFIG_TIMEOUT=""
+CONFIG_CONTROL_TAKE_TIMEOUT=""
+CONFIG_INSECURE=""
+
+load_config_file() {
+  local file="$1" line key value
+  [[ -f "$file" ]] || return 0
+  [[ -r "$file" ]] || die "config file is not readable: $file"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    [[ "$key" != "$line" ]] || continue
+    case "$key" in
+      FRANKA_DESKAPI_HOST|host) CONFIG_HOST="$value" ;;
+      FRANKA_DESKAPI_USER|username) CONFIG_USERNAME="$value" ;;
+      FRANKA_DESKAPI_PASSWORD|password) CONFIG_PASSWORD="$value" ;;
+      FRANKA_DESKAPI_TOKEN_FILE|token_file) CONFIG_TOKEN_FILE="$value" ;;
+      FRANKA_DESKAPI_TIMEOUT|timeout) CONFIG_TIMEOUT="$value" ;;
+      FRANKA_DESKAPI_CONTROL_TAKE_TIMEOUT|control_take_timeout) CONFIG_CONTROL_TAKE_TIMEOUT="$value" ;;
+      FRANKA_DESKAPI_INSECURE|insecure) CONFIG_INSECURE="$value" ;;
+    esac
+  done < "$file"
+}
+
+normalize_bool_setting() {
+  local value="$1" name="$2"
+  case "$value" in
+    1|true|TRUE|yes|YES|on|ON) printf '1' ;;
+    0|false|FALSE|no|NO|off|OFF) printf '0' ;;
+    *) die "$name must be 1/0, true/false, yes/no, or on/off" ;;
+  esac
+}
+
+load_config_file "$CONFIG_FILE"
+
+HOST="${FRANKA_DESKAPI_HOST:-${CONFIG_HOST:-$DEFAULT_HOST}}"
+USERNAME="${FRANKA_DESKAPI_USER:-${CONFIG_USERNAME:-$DEFAULT_USERNAME}}"
+PASSWORD="${FRANKA_DESKAPI_PASSWORD:-${CONFIG_PASSWORD:-$DEFAULT_PASSWORD}}"
+CONTROL_TOKEN="${FRANKA_CONTROL_TOKEN:-$DEFAULT_CONTROL_TOKEN}"
+TOKEN_FILE="${FRANKA_DESKAPI_TOKEN_FILE:-${CONFIG_TOKEN_FILE:-$CONFIG_DIR/control-token}}"
+TOKEN_ID_FILE="${FRANKA_DESKAPI_TOKEN_ID_FILE:-$TOKEN_FILE.id}"
+TIMEOUT="${FRANKA_DESKAPI_TIMEOUT:-${CONFIG_TIMEOUT:-$DEFAULT_TIMEOUT}}"
+CONTROL_TAKE_TIMEOUT="${FRANKA_DESKAPI_CONTROL_TAKE_TIMEOUT:-${CONFIG_CONTROL_TAKE_TIMEOUT:-$DEFAULT_CONTROL_TAKE_TIMEOUT}}"
+INSECURE="${FRANKA_DESKAPI_INSECURE:-${CONFIG_INSECURE:-$DEFAULT_INSECURE}}"
+INSECURE="$(normalize_bool_setting "$INSECURE" "FRANKA_DESKAPI_INSECURE")"
+CONTROL_TOKEN_FROM_USER=0
+[[ -n "${FRANKA_CONTROL_TOKEN:-}" ]] && CONTROL_TOKEN_FROM_USER=1
+NO_TOKEN_FILE=0
+VERBOSE=0
+DRY_RUN=0
+JSON_OUTPUT=0
+
+usage() {
+  cat <<'EOF'
+usage: franka [global-options] <group> <command> [command-options]
+
+Global options:
+  --host HOST                 Robot URL or hostname. Env: FRANKA_DESKAPI_HOST
+  -u, --username USER         Basic auth username. Env: FRANKA_DESKAPI_USER
+  -p, --password PASS         Basic auth password. Env: FRANKA_DESKAPI_PASSWORD
+  --control-token TOKEN       SPoC token. Env: FRANKA_CONTROL_TOKEN
+  --token-file PATH           Stored SPoC token path
+  --no-token-file             Do not read or write the token file
+  --timeout SECONDS           curl max time. Env: FRANKA_DESKAPI_TIMEOUT
+  --insecure                  Disable TLS certificate verification
+  --secure                    Enable TLS certificate verification
+  -v, --verbose               Show response headers on errors
+  --dry-run                   Print request instead of sending it
+  --json                      Print raw JSON where supported
+  -h, --help                  Show help
+
+Groups:
+  setup           Configure robot host and credentials for this user
+  status          Summarize robot, control token, arm, FCI, and safety state
+  doctor          Alias for status
+  on              Unlock arm if needed, then activate FCI
+  lock            Deactivate FCI if needed, then lock arm
+  completion      Generate shell completion
+  system          System state, software, logs, reboot, shutdown
+  control         SPoC control token
+  arm             Robot arm
+  end-effector    End effector power
+  ee              Alias for end-effector
+  fci             Franka Control Interface
+  config          System configuration
+  safety          Safety, self-tests, recovery
+  raw             Call any endpoint directly
+
+Examples:
+  ./franka setup
+  ./franka system state
+  ./franka status
+  ./franka on
+  ./franka lock
+  ./franka completion bash
+  ./franka control take
+  ./franka arm unlock
+  ./franka config arm-mounting-set --body @mounting.json
+  ./franka raw PATCH /api/configuration --body @configuration.patch.json
+EOF
+}
+
+usage_system() {
+  cat <<'EOF'
+usage: franka system <command>
+
+Commands:
+  state                    Get the current system state
+  watch                    Subscribe to system state SSE events
+  operating-mode           Get the current operating mode
+  operating-mode-change    Change operating mode. Requires --body
+  software                 Get installed software state
+  software-status-token    Get software status token
+  updates                  Get pending software updates
+  updates-reset            Reset pending software updates
+  updates-prepare-online   Prepare online update. Accepts --body
+  updates-prepare-offline  Prepare offline update. Accepts --file or --body
+  updates-apply            Apply pending updates. Accepts --body
+  log                      Get encrypted system log. Accepts --output
+  public-cyclic-log        Get cyclic public logs
+  public-event-log         Get event public logs
+  shutdown                 Initiate shutdown. Requires confirmation or --yes
+  reboot                   Initiate reboot. Requires confirmation or --yes
+EOF
+}
+
+usage_control() {
+  cat <<'EOF'
+usage: franka control <command>
+
+Commands:
+  state      Get current SPoC token state
+  take       Take SPoC token. Uses hostname as owner; accepts --owner, --wait, --request, --show-token, or --body
+  release    Release SPoC token and delete local token file
+
+Options for take:
+  --owner NAME         Owner name sent to Desk API. Default: hostname
+  --wait SECONDS       Desk API wait timeout. Default: 1
+  --wait none          Omit the Desk API timeout and wait indefinitely
+  --request            Request control transfer if another owner holds the token
+  --show-token         Print the token value after taking or reusing control
+  --body JSON|@file|-  Send an exact request body and skip the ownership preflight
+EOF
+}
+
+usage_arm() {
+  cat <<'EOF'
+usage: franka arm <command>
+
+Commands:
+  info            Get arm information
+  joints          Get all joint states
+  warnings        Get arm warnings
+  lock            Lock all joints
+  unlock          Unlock all joints
+  motion-start    Start arm motion. Requires --body
+  motion-stop     Stop active arm motion
+EOF
+}
+
+usage_end_effector() {
+  cat <<'EOF'
+usage: franka end-effector <command>
+
+Commands:
+  power       Get end effector power state
+  power-on    Power on end effector
+  power-off   Power off end effector
+EOF
+}
+
+usage_fci() {
+  cat <<'EOF'
+usage: franka fci <command>
+
+Commands:
+  state        Get FCI state
+  activate     Activate FCI
+  deactivate   Deactivate FCI
+EOF
+}
+
+usage_config() {
+  cat <<'EOF'
+usage: franka config <command>
+
+Commands:
+  get                Get system configuration
+  patch              Patch configuration. Requires --body
+  initial            Set initial configuration. Requires --body
+  arm-mounting       Get arm mounting state
+  arm-mounting-set   Set arm mounting state. Requires --body
+EOF
+}
+
+usage_safety() {
+  cat <<'EOF'
+usage: franka safety <command>
+
+Commands:
+  self-tests              Get self-test state
+  execute-self-tests      Execute self-tests
+  log                     Get safety log. Accepts --output
+  configuration-apply     Apply safety configuration. Accepts --file or --body
+  recovery                Get recovery status
+  recovery-start          Start recovery. Requires --type
+  recovery-confirm        Confirm recovery. Requires --type
+  joint-motion-start      Start joint recovery motion. Requires --body
+  joint-motion-continue   Continue motion. Requires --token or --body
+  joint-motion-stop       Stop joint recovery motion
+EOF
+}
+
+usage_raw() {
+  cat <<'EOF'
+usage: franka raw METHOD PATH [options]
+
+Options:
+  --body JSON|@file|-       Send JSON body
+  --file FILE               Send file bytes
+  --content-type TYPE       Content-Type for --file
+  --output FILE             Write response body to file
+
+Examples:
+  ./franka raw GET /api/system
+  ./franka raw PATCH /api/configuration --body @configuration.patch.json
+EOF
+}
+
+usage_completion() {
+  cat <<'EOF'
+usage: franka completion <shell>
+
+Shells:
+  bash      Generate Bash completion
+
+Example:
+  ./franka completion bash > ~/.local/share/bash-completion/completions/franka
+EOF
+}
+
+usage_setup() {
+  cat <<'EOF'
+usage: franka setup [options]
+
+Configure this user's Desk API connection. The config is stored with 0600
+permissions, then environment variables and command-line flags can override it.
+
+Options:
+  --host HOST                         Robot URL or hostname
+  -u, --username USER                 Basic auth username
+  -p, --password PASS                 Basic auth password
+  --token-file PATH                   Stored SPoC token path
+  --timeout SECONDS                   curl max time
+  --control-take-timeout SECONDS      Default SPoC take wait timeout
+  --insecure                          Disable TLS certificate verification
+  --secure                            Enable TLS certificate verification
+  --show                              Print current setup summary
+  --reset                             Delete this user's setup config
+  -h, --help                          Show help
+
+Examples:
+  franka setup
+  franka setup --host <robot-ip> --username <desk-user> --password '<password>'
+  franka setup --show
+EOF
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+default_owner() {
+  hostname 2>/dev/null || printf 'franka-cli'
+}
+
+read_body() {
+  local value="${1-}"
+  [[ -n "$value" ]] || value="{}"
+  if [[ "$value" == "-" ]]; then
+    cat
+  elif [[ "$value" == @* ]]; then
+    cat "${value#@}"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+extract_token() {
+  sed -nE 's/.*"(token|controlToken|control_token|value)"[[:space:]]*:[[:space:]]*"([^"]+)".*/\2/p' | head -n 1
+}
+
+extract_token_id() {
+  sed -nE 's/.*"tokenId"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' | head -n 1
+}
+
+extract_json_string() {
+  local key="$1"
+  sed -nE "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\\1/p" | head -n 1
+}
+
+extract_json_number() {
+  local key="$1"
+  sed -nE "s/.*\"$key\"[[:space:]]*:[[:space:]]*([0-9]+([.][0-9]+)?).*/\\1/p" | head -n 1
+}
+
+extract_json_bool() {
+  local key="$1"
+  sed -nE "s/.*\"$key\"[[:space:]]*:[[:space:]]*(true|false).*/\\1/p" | head -n 1
+}
+
+require_positive_json_number() {
+  [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ && "$1" =~ [1-9] ]] || die "$2 must be a positive JSON number"
+}
+
+load_token() {
+  if [[ "$NO_TOKEN_FILE" -eq 0 && -z "$CONTROL_TOKEN" && -f "$TOKEN_FILE" ]]; then
+    CONTROL_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+    CONTROL_TOKEN_FROM_USER=0
+  fi
+  return 0
+}
+
+save_token() {
+  local token="$1"
+  local token_id="${2:-}"
+  [[ "$NO_TOKEN_FILE" -eq 1 || -z "$token" ]] && return 0
+  mkdir -p "$(dirname "$TOKEN_FILE")"
+  umask 077
+  printf '%s\n' "$token" > "$TOKEN_FILE"
+  [[ -n "$token_id" ]] && printf '%s\n' "$token_id" > "$TOKEN_ID_FILE"
+  return 0
+}
+
+delete_token() {
+  [[ "$NO_TOKEN_FILE" -eq 1 ]] && return 0
+  rm -f "$TOKEN_FILE" "$TOKEN_ID_FILE"
+}
+
+load_token_id() {
+  [[ "$NO_TOKEN_FILE" -eq 0 && -f "$TOKEN_ID_FILE" ]] && tr -d '\r\n' < "$TOKEN_ID_FILE"
+}
+
+print_token_json() {
+  local token="$1" token_id="${2:-}"
+  if [[ -n "$token_id" ]]; then
+    printf '{"token":"%s","tokenId":%s}\n' "$(json_escape "$token")" "$token_id"
+  else
+    printf '{"token":"%s"}\n' "$(json_escape "$token")"
+  fi
+}
+
+print_owner_message() {
+  local prefix="$1" owner="$2" token_id="${3:-}"
+  if [[ -n "$token_id" ]]; then
+    printf '%s%s (tokenId=%s)\n' "$prefix" "$owner" "$token_id" >&2
+  else
+    printf '%s%s\n' "$prefix" "$owner" >&2
+  fi
+}
+
+get_control_state() {
+  api_request GET /api/system/control-token "" "" "application/octet-stream" "" 0
+}
+
+hint_take_control() {
+  local owner="$1" token_id="${2:-}" local_owner
+  local_owner="$(default_owner)"
+  if [[ -n "$owner" ]]; then
+    print_owner_message "control token owned by " "$owner" "$token_id"
+    if [[ "$owner" == "$local_owner" ]]; then
+      printf 'release control from Desk, then run: franka control take\n' >&2
+    else
+      printf 'request control with: franka control take --request --wait SECONDS\n' >&2
+    fi
+  else
+    printf 'control token is available; run: franka control take\n' >&2
+  fi
+}
+
+ensure_control_token_for_action() {
+  local action="$1" state current_owner current_token_id saved_token_id
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+
+  state="$(get_control_state)"
+  current_owner="$(printf '%s' "$state" | extract_json_string owner || true)"
+  current_token_id="$(printf '%s' "$state" | extract_token_id || true)"
+  saved_token_id=""
+  [[ "$CONTROL_TOKEN_FROM_USER" -eq 0 ]] && saved_token_id="$(load_token_id || true)"
+
+  if [[ -z "$CONTROL_TOKEN" ]]; then
+    printf 'cannot %s: no local control token\n' "$action" >&2
+    hint_take_control "$current_owner" "$current_token_id"
+    return 1
+  fi
+
+  if [[ -n "$saved_token_id" && -n "$current_token_id" && "$saved_token_id" != "$current_token_id" ]]; then
+    printf 'cannot %s: saved control token is stale (saved tokenId=%s, active tokenId=%s)\n' "$action" "$saved_token_id" "$current_token_id" >&2
+    hint_take_control "$current_owner" "$current_token_id"
+    return 1
+  fi
+
+  return 0
+}
+
+print_friendly_result() {
+  local result="$1" message="$2"
+  if [[ -z "$result" || "$result" =~ ^20[0-9]$ ]]; then
+    printf '%s\n' "$message"
+  else
+    printf '%s\n' "$result"
+  fi
+}
+
+print_control_token_result() {
+  local token="$1" token_id="${2:-}" prefix="$3" show_token="${4:-0}"
+  if [[ "$JSON_OUTPUT" -eq 1 || "$show_token" -eq 1 ]]; then
+    print_token_json "$token" "$token_id"
+  elif [[ -n "$token_id" ]]; then
+    printf '%s (tokenId=%s)\n' "$prefix" "$token_id"
+  else
+    printf '%s\n' "$prefix"
+  fi
+}
+
+print_error_hint() {
+  local status="$1" path="$2" body_file="$3"
+
+  if [[ "$status" == "423" ]]; then
+    printf 'hint: this endpoint requires SPoC; run: franka control take\n' >&2
+    return 0
+  fi
+
+  if grep -q '"BrakesClosed"' "$body_file"; then
+    printf 'hint: brakes are closed; run: franka arm unlock\n' >&2
+  fi
+  if grep -q '"WrongOperatingMode"' "$body_file"; then
+    printf 'hint: switch to Execution mode before retrying\n' >&2
+  fi
+  if grep -q '"EmergencyStopPressed"' "$body_file"; then
+    printf 'hint: release the emergency stop, then retry\n' >&2
+  fi
+  if grep -q '"RecoverableErrorActive"' "$body_file"; then
+    printf 'hint: inspect recovery state with: franka safety recovery\n' >&2
+  fi
+  if grep -q '"SafetySettingsUnvalidated"' "$body_file"; then
+    printf 'hint: validate safety settings in Watchman before retrying\n' >&2
+  fi
+  if grep -q '"FeatureNotInstalled"' "$body_file"; then
+    printf 'hint: required robot feature is not installed\n' >&2
+  fi
+  if grep -q '"Timeout"' "$body_file" && [[ "$path" == "/api/system/control-token:take" ]]; then
+    printf 'hint: control was not granted before the wait timeout; check Desk or retry with --wait SECONDS\n' >&2
+  fi
+  return 0
+}
+
+confirm_destructive_action() {
+  local action="$1" yes="$2" answer
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  [[ "$yes" -eq 1 ]] && return 0
+  if [[ ! -t 0 ]]; then
+    die "refusing to $action without confirmation; pass --yes"
+  fi
+  printf 'Type "%s" to confirm: ' "$action" >&2
+  read -r answer
+  [[ "$answer" == "$action" ]] || die "$action cancelled"
+}
+
+parse_yes_option() {
+  YES=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes|-y) YES=1; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+}
+
+mask_secret_state() {
+  if [[ -n "$1" ]]; then
+    printf 'set'
+  else
+    printf 'missing'
+  fi
+}
+
+print_setup_summary_values() {
+  local config_file="$1" host="$2" username="$3" password="$4" token_file="$5" timeout="$6" control_take_timeout="$7" insecure="$8"
+  printf 'config: %s\n' "$config_file"
+  printf 'host: %s\n' "${host:-not set}"
+  printf 'username: %s\n' "${username:-not set}"
+  printf 'password: %s\n' "$(mask_secret_state "$password")"
+  printf 'token file: %s\n' "${token_file:-not set}"
+  printf 'timeout: %s\n' "${timeout:-not set}"
+  printf 'control take timeout: %s\n' "${control_take_timeout:-not set}"
+  if [[ "$insecure" -eq 1 ]]; then
+    printf 'TLS verification: disabled\n'
+  else
+    printf 'TLS verification: enabled\n'
+  fi
+}
+
+print_setup_summary() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    printf 'setup config exists\n'
+  else
+    printf 'setup config is missing; run: franka setup\n'
+  fi
+  print_setup_summary_values "$CONFIG_FILE" "$HOST" "$USERNAME" "$PASSWORD" "$TOKEN_FILE" "$TIMEOUT" "$CONTROL_TAKE_TIMEOUT" "$INSECURE"
+}
+
+prompt_value() {
+  local label="$1" current="$2" value
+  if [[ -n "$current" ]]; then
+    printf '%s [%s]: ' "$label" "$current" >&2
+  else
+    printf '%s: ' "$label" >&2
+  fi
+  IFS= read -r value
+  if [[ -n "$value" ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$current"
+  fi
+}
+
+prompt_secret_value() {
+  local label="$1" current="$2" value
+  if [[ -n "$current" ]]; then
+    printf '%s [saved, Enter to keep]: ' "$label" >&2
+  else
+    printf '%s: ' "$label" >&2
+  fi
+  IFS= read -r -s value
+  printf '\n' >&2
+  if [[ -n "$value" ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$current"
+  fi
+}
+
+prompt_tls_verification() {
+  local current="$1" answer
+  while true; do
+    if [[ "$current" -eq 1 ]]; then
+      printf 'Disable TLS certificate verification? [Y/n]: ' >&2
+    else
+      printf 'Disable TLS certificate verification? [y/N]: ' >&2
+    fi
+    IFS= read -r answer
+    case "$answer" in
+      "") printf '%s' "$current"; return 0 ;;
+      y|Y|yes|YES) printf '1'; return 0 ;;
+      n|N|no|NO) printf '0'; return 0 ;;
+      *) printf 'Please answer yes or no.\n' >&2 ;;
+    esac
+  done
+}
+
+validate_config_value() {
+  local name="$1" value="$2"
+  case "$value" in
+    *$'\n'*|*$'\r'*) die "$name cannot contain newlines" ;;
+  esac
+}
+
+write_setup_config() {
+  local host="$1" username="$2" password="$3" token_file="$4" timeout="$5" control_take_timeout="$6" insecure="$7"
+  local dir tmp
+
+  validate_config_value "host" "$host"
+  validate_config_value "username" "$username"
+  validate_config_value "password" "$password"
+  validate_config_value "token file" "$token_file"
+  require_positive_json_number "$timeout" "--timeout"
+  require_positive_json_number "$control_take_timeout" "--control-take-timeout"
+  insecure="$(normalize_bool_setting "$insecure" "FRANKA_DESKAPI_INSECURE")"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'would write setup config: %s\n' "$CONFIG_FILE"
+    print_setup_summary_values "$CONFIG_FILE" "$host" "$username" "$password" "$token_file" "$timeout" "$control_take_timeout" "$insecure"
+    return 0
+  fi
+
+  dir="$(dirname "$CONFIG_FILE")"
+  mkdir -p "$dir"
+  tmp="$(mktemp "$dir/config.XXXXXX")"
+  trap 'rm -f "${tmp:-}"; trap - RETURN' RETURN
+  {
+    printf '# Franka Desk API CLI config\n'
+    printf '# Created by franka setup. Keep this file private.\n'
+    printf 'FRANKA_DESKAPI_HOST=%s\n' "$host"
+    printf 'FRANKA_DESKAPI_USER=%s\n' "$username"
+    printf 'FRANKA_DESKAPI_PASSWORD=%s\n' "$password"
+    printf 'FRANKA_DESKAPI_TOKEN_FILE=%s\n' "$token_file"
+    printf 'FRANKA_DESKAPI_TIMEOUT=%s\n' "$timeout"
+    printf 'FRANKA_DESKAPI_CONTROL_TAKE_TIMEOUT=%s\n' "$control_take_timeout"
+    printf 'FRANKA_DESKAPI_INSECURE=%s\n' "$insecure"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+  trap - RETURN
+
+  printf 'saved setup: %s\n' "$CONFIG_FILE"
+  print_setup_summary_values "$CONFIG_FILE" "$host" "$username" "$password" "$token_file" "$timeout" "$control_take_timeout" "$insecure"
+}
+
+handle_setup() {
+  local host="$HOST" username="$USERNAME" password="$PASSWORD" token_file="$TOKEN_FILE" timeout="$TIMEOUT"
+  local control_take_timeout="$CONTROL_TAKE_TIMEOUT" insecure="$INSECURE"
+  local show=0 reset=0 set_any=0 full_prompt=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host) host="$2"; set_any=1; shift 2 ;;
+      -u|--username) username="$2"; set_any=1; shift 2 ;;
+      -p|--password) password="$2"; set_any=1; shift 2 ;;
+      --token-file) token_file="$2"; set_any=1; shift 2 ;;
+      --timeout) timeout="$2"; set_any=1; shift 2 ;;
+      --control-take-timeout) control_take_timeout="$2"; set_any=1; shift 2 ;;
+      --insecure) insecure=1; set_any=1; shift ;;
+      --secure) insecure=0; set_any=1; shift ;;
+      --show) show=1; shift ;;
+      --reset) reset=1; shift ;;
+      -h|--help|help) usage_setup; return 0 ;;
+      *) die "unknown setup option: $1" ;;
+    esac
+  done
+
+  [[ "$show" -eq 0 || "$reset" -eq 0 ]] || die "use either --show or --reset, not both"
+
+  if [[ "$show" -eq 1 ]]; then
+    print_setup_summary
+    return 0
+  fi
+
+  if [[ "$reset" -eq 1 ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      printf 'would remove setup config: %s\n' "$CONFIG_FILE"
+    else
+      rm -f "$CONFIG_FILE"
+      printf 'removed setup config: %s\n' "$CONFIG_FILE"
+    fi
+    printf 'control token file was not removed: %s\n' "$TOKEN_FILE"
+    return 0
+  fi
+
+  if [[ "$set_any" -eq 0 ]]; then
+    full_prompt=1
+    [[ -t 0 ]] || die "interactive setup requires a terminal; pass setup options instead"
+  fi
+
+  if [[ -t 0 && ( "$full_prompt" -eq 1 || -z "$host" || -z "$username" || -z "$password" ) ]]; then
+    printf 'Configuring Desk API for this user.\n' >&2
+    printf 'Config file: %s\n' "$CONFIG_FILE" >&2
+    host="$(prompt_value "Robot host or URL" "$host")"
+    username="$(prompt_value "Basic auth username" "$username")"
+    password="$(prompt_secret_value "Basic auth password" "$password")"
+    if [[ "$full_prompt" -eq 1 ]]; then
+      token_file="$(prompt_value "Control token file" "$token_file")"
+      timeout="$(prompt_value "Request timeout seconds" "$timeout")"
+      control_take_timeout="$(prompt_value "Control take wait seconds" "$control_take_timeout")"
+      insecure="$(prompt_tls_verification "$insecure")"
+    fi
+  fi
+
+  [[ -n "$host" ]] || die "host is required"
+  [[ -n "$username" ]] || die "username is required"
+  [[ -n "$password" ]] || die "password is required"
+  [[ -n "$token_file" ]] || die "token file is required"
+
+  write_setup_config "$host" "$username" "$password" "$token_file" "$timeout" "$control_take_timeout" "$insecure"
+}
+
+normalize_host() {
+  [[ -n "$HOST" ]] || die "host is required; run: franka setup"
+  [[ -n "$USERNAME" ]] || die "username is required; run: franka setup"
+  [[ -n "$PASSWORD" ]] || die "password is required; run: franka setup"
+  case "$HOST" in
+    http://*|https://*) ;;
+    *) HOST="https://$HOST" ;;
+  esac
+  HOST="${HOST%/}"
+}
+
+curl_common_args() {
+  local include_control_token="${1:-1}"
+  CURL_ARGS=(-sS --connect-timeout "$TIMEOUT")
+  [[ "$INSECURE" -eq 1 ]] && CURL_ARGS+=(-k)
+  [[ -n "$USERNAME" && -n "$PASSWORD" ]] && CURL_ARGS+=(-u "$USERNAME:$PASSWORD")
+  [[ "$include_control_token" -eq 1 && -n "$CONTROL_TOKEN" ]] && CURL_ARGS+=(-H "X-Control-Token: $CONTROL_TOKEN")
+  return 0
+}
+
+api_request() {
+  local method="$1"
+  local path="$2"
+  local body="${3-}"
+  local upload_file="${4-}"
+  local content_type="${5:-application/octet-stream}"
+  local output="${6-}"
+  local include_control_token="${7:-1}"
+  local body_file header_file status url
+
+  normalize_host
+  url="$HOST$path"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'METHOD %s\n' "$method"
+    printf 'URL %s\n' "$url"
+    [[ "$INSECURE" -eq 1 ]] && printf 'TLS verify disabled\n'
+    [[ "$INSECURE" -eq 0 ]] && printf 'TLS verify enabled\n'
+    [[ -n "$USERNAME" && -n "$PASSWORD" ]] && printf 'AUTH Basic username=%s password=<redacted>\n' "$USERNAME"
+    [[ "$include_control_token" -eq 1 && -n "$CONTROL_TOKEN" ]] && printf 'HEADER X-Control-Token: <redacted>\n'
+    if [[ -n "$upload_file" ]]; then
+      printf 'HEADER Content-Type: %s\n' "$content_type"
+      printf 'FILE %s\n' "$upload_file"
+    elif [[ -n "$body" ]]; then
+      printf 'HEADER Content-Type: application/json\n'
+      printf 'BODY '
+      printf '%s' "$body"
+      printf '\n'
+    fi
+    return 0
+  fi
+
+  body_file="$(mktemp)"
+  header_file="$(mktemp)"
+  trap 'rm -f "${body_file:-}" "${header_file:-}"; trap - RETURN' RETURN
+
+  curl_common_args "$include_control_token"
+  CURL_ARGS+=(-X "$method" --max-time "$TIMEOUT" -D "$header_file" -o "$body_file" -w '%{http_code}' -H 'Accept: application/json')
+
+  if [[ -n "$upload_file" ]]; then
+    CURL_ARGS+=(-H "Content-Type: $content_type" --data-binary "@$upload_file")
+  elif [[ -n "$body" ]]; then
+    CURL_ARGS+=(-H 'Content-Type: application/json' --data-binary "$body")
+  fi
+
+  status="$(curl "${CURL_ARGS[@]}" "$url")" || {
+    rm -f "$body_file" "$header_file"
+    die "curl request failed"
+  }
+
+  if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+    printf 'HTTP %s\n' "$status" >&2
+    [[ "$VERBOSE" -eq 1 ]] && cat "$header_file" >&2
+    cat "$body_file" >&2
+    printf '\n' >&2
+    print_error_hint "$status" "$path" "$body_file"
+    return 1
+  fi
+
+  if [[ -n "$output" ]]; then
+    cp "$body_file" "$output"
+  elif [[ -s "$body_file" ]]; then
+    cat "$body_file"
+    printf '\n'
+  else
+    printf '%s\n' "$status"
+  fi
+}
+
+api_sse() {
+  local path="$1"
+  normalize_host
+  curl_common_args
+  CURL_ARGS+=(-N -H 'Accept: text/event-stream')
+  curl "${CURL_ARGS[@]}" "$HOST$path"
+}
+
+api_request_friendly() {
+  local message="$1" result
+  shift
+  if ! result="$(api_request "$@")"; then
+    return 1
+  fi
+  print_friendly_result "$result" "$message"
+}
+
+api_request_spoc_friendly() {
+  local action="$1" message="$2"
+  shift 2
+  ensure_control_token_for_action "$action" || return 1
+  api_request_friendly "$message" "$@"
+}
+
+api_request_read() {
+  local formatter="$1" result
+  shift
+  if ! result="$(api_request "$@")"; then
+    return 1
+  fi
+  if [[ "$JSON_OUTPUT" -eq 1 || "$DRY_RUN" -eq 1 ]]; then
+    printf '%s\n' "$result"
+  else
+    "$formatter" "$result"
+  fi
+}
+
+format_system_state() {
+  local json="$1" status mode cloud reason serial
+  status="$(printf '%s' "$json" | extract_json_string status || true)"
+  mode="$(printf '%s' "$json" | sed -nE 's/.*"operatingMode"[[:space:]]*:[[:space:]]*\{[^}]*"status"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -n 1)"
+  cloud="$(printf '%s' "$json" | sed -nE 's/.*"connection"[[:space:]]*:[[:space:]]*\{[^}]*"status"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -n 1)"
+  reason="$(printf '%s' "$json" | extract_json_string offlineReason || true)"
+  serial="$(printf '%s' "$json" | extract_json_string controlSerialNumber || true)"
+  printf 'system: %s\n' "${status:-unknown}"
+  [[ -n "$mode" ]] && printf 'operating mode: %s\n' "$mode"
+  if [[ -n "$cloud" && -n "$reason" ]]; then
+    printf 'cloud: %s (%s)\n' "$cloud" "$reason"
+  elif [[ -n "$cloud" ]]; then
+    printf 'cloud: %s\n' "$cloud"
+  fi
+  [[ -n "$serial" ]] && printf 'control serial: %s\n' "$serial"
+  return 0
+}
+
+format_simple_status() {
+  local label="$1" json="$2" status
+  status="$(printf '%s' "$json" | extract_json_string status || true)"
+  printf '%s: %s\n' "$label" "${status:-unknown}"
+  return 0
+}
+
+format_operating_mode() {
+  format_simple_status "operating mode" "$1"
+}
+
+format_control_state() {
+  local json="$1" owner requester token_id saved_token_id local_state
+  owner="$(printf '%s' "$json" | extract_json_string owner || true)"
+  requester="$(printf '%s' "$json" | extract_json_string requester || true)"
+  token_id="$(printf '%s' "$json" | extract_token_id || true)"
+  saved_token_id="$(load_token_id || true)"
+
+  if [[ -n "$owner" ]]; then
+    if [[ -n "$token_id" ]]; then
+      printf 'control token: owned by %s (tokenId=%s)\n' "$owner" "$token_id"
+    else
+      printf 'control token: owned by %s\n' "$owner"
+    fi
+  else
+    printf 'control token: available\n'
+  fi
+
+  if [[ -n "$requester" ]]; then
+    printf 'requester: %s\n' "$requester"
+  fi
+
+  local_state="missing"
+  if [[ -n "$CONTROL_TOKEN" ]]; then
+    local_state="present"
+    if [[ -n "$saved_token_id" && -n "$token_id" ]]; then
+      if [[ "$saved_token_id" == "$token_id" ]]; then
+        local_state="valid"
+      else
+        local_state="stale (saved tokenId=$saved_token_id)"
+      fi
+    fi
+  fi
+  printf 'local token: %s\n' "$local_state"
+  return 0
+}
+
+arm_brake_summary() {
+  local json="$1"
+  if [[ "$json" == *'"brakeStatus":"Locked"'* && "$json" != *'"brakeStatus":"Unlocked"'* ]]; then
+    printf 'locked'
+  elif [[ "$json" == *'"brakeStatus":"Unlocked"'* && "$json" != *'"brakeStatus":"Locked"'* ]]; then
+    printf 'unlocked'
+  elif [[ "$json" == *'"brakeStatus"'* ]]; then
+    printf 'mixed'
+  else
+    printf 'unknown'
+  fi
+}
+
+format_arm_info() {
+  local json="$1" status arm_type
+  status="$(printf '%s' "$json" | extract_json_string status || true)"
+  arm_type="$(printf '%s' "$json" | extract_json_string armType || true)"
+  if [[ -n "$arm_type" ]]; then
+    printf 'arm: %s (%s)\n' "${status:-unknown}" "$arm_type"
+  else
+    printf 'arm: %s\n' "${status:-unknown}"
+  fi
+  return 0
+}
+
+format_arm_joints() {
+  local json="$1" summary
+  summary="$(arm_brake_summary "$json")"
+  printf 'arm joints: %s\n' "$summary"
+  if [[ "$summary" == "mixed" ]]; then
+    printf '%s' "$json" |
+      sed -E 's/\},[[:space:]]*\{/\}\n\{/g' |
+      sed -nE 's/.*"brakeStatus"[[:space:]]*:[[:space:]]*"([^"]+)".*"joint"[[:space:]]*:[[:space:]]*([0-9]+).*/joint \2: \1/p'
+  fi
+  return 0
+}
+
+format_arm_warnings() {
+  local json="$1" close_to_singularity
+  close_to_singularity="$(printf '%s' "$json" | extract_json_bool closeToSingularity || true)"
+  if [[ "$close_to_singularity" == "true" ]]; then
+    printf 'arm warnings: close to singularity\n'
+  elif [[ "$json" == "{}" || "$close_to_singularity" == "false" ]]; then
+    printf 'arm warnings: none\n'
+  else
+    printf 'arm warnings available; use --json for details\n'
+  fi
+  return 0
+}
+
+format_end_effector_power() {
+  format_simple_status "end effector power" "$1"
+}
+
+format_fci_state() {
+  format_simple_status "FCI" "$1"
+}
+
+format_self_tests() {
+  local json="$1" status remaining hours minutes
+  status="$(printf '%s' "$json" | extract_json_string status || true)"
+  remaining="$(printf '%s' "$json" | extract_json_number remaining || true)"
+  printf 'self-tests: %s\n' "${status:-unknown}"
+  if [[ -n "$remaining" && "$remaining" =~ ^[0-9]+$ ]]; then
+    hours=$((remaining / 3600))
+    minutes=$(((remaining % 3600) / 60))
+    printf 'self-tests remaining: %sh %sm\n' "$hours" "$minutes"
+  fi
+  return 0
+}
+
+format_recovery() {
+  local json="$1" type
+  if [[ "$json" == "{}" ]]; then
+    printf 'safety recovery: none pending\n'
+    return 0
+  fi
+  type="$(printf '%s' "$json" | extract_json_string type || true)"
+  if [[ -n "$type" ]]; then
+    printf 'safety recovery: %s pending\n' "$type"
+  else
+    printf 'safety recovery pending; use --json for details\n'
+  fi
+}
+
+format_updates() {
+  local json="$1" factory_reset
+  factory_reset="$(printf '%s' "$json" | extract_json_bool factoryResetRequired || true)"
+  if [[ "$json" == *'"add":[]'* && "$json" == *'"remove":[]'* && "$json" == *'"update":[]'* ]]; then
+    printf 'software updates: none pending\n'
+  else
+    printf 'software updates pending; use --json for details\n'
+  fi
+  [[ "$factory_reset" == "true" ]] && printf 'software updates: factory reset required\n'
+  return 0
+}
+
+format_software() {
+  local json="$1" os_version features
+  os_version="$(printf '%s' "$json" | extract_json_string osVersion || true)"
+  features="$(printf '%s' "$json" | grep -o '"featureName":"[^"]*"' | sed 's/"featureName":"//; s/"//' | paste -sd, - | sed 's/,/, /g' || true)"
+  [[ -n "$os_version" ]] && printf 'software OS: %s\n' "$os_version"
+  [[ -n "$features" ]] && printf 'features: %s\n' "$features"
+  format_updates "$json"
+  return 0
+}
+
+format_arm_mounting() {
+  local json="$1" pitch roll yaw
+  pitch="$(printf '%s' "$json" | extract_json_number pitch || true)"
+  roll="$(printf '%s' "$json" | extract_json_number roll || true)"
+  yaw="$(printf '%s' "$json" | extract_json_number yaw || true)"
+  printf 'arm mounting orientation: roll=%s pitch=%s yaw=%s\n' "${roll:-unknown}" "${pitch:-unknown}" "${yaw:-unknown}"
+  return 0
+}
+
+format_config_summary() {
+  printf 'configuration retrieved; rerun with --json to print the full configuration\n'
+}
+
+handle_status() {
+  local system_state control_state arm_info arm_joints ee_power fci_state self_tests recovery
+  system_state="$(api_request GET /api/system)"
+  control_state="$(get_control_state)"
+  arm_info="$(api_request GET /api/arm)"
+  arm_joints="$(api_request GET /api/arm/joints)"
+  ee_power="$(api_request GET /api/end-effector/power)"
+  fci_state="$(api_request GET /api/fci)"
+  self_tests="$(api_request GET /api/safety/self-tests)"
+  recovery="$(api_request GET /api/safety/recovery)"
+
+  if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+    printf '{"system":%s,"control":%s,"arm":%s,"joints":%s,"endEffectorPower":%s,"fci":%s,"selfTests":%s,"recovery":%s}\n' \
+      "$system_state" "$control_state" "$arm_info" "$arm_joints" "$ee_power" "$fci_state" "$self_tests" "$recovery"
+    return 0
+  fi
+
+  format_system_state "$system_state"
+  format_control_state "$control_state"
+  format_arm_info "$arm_info"
+  format_arm_joints "$arm_joints"
+  format_end_effector_power "$ee_power"
+  format_fci_state "$fci_state"
+  format_self_tests "$self_tests"
+  format_recovery "$recovery"
+}
+
+arm_lock_action() {
+  local joints summary
+  joints="$(api_request GET /api/arm/joints)"
+  summary="$(arm_brake_summary "$joints")"
+  if [[ "$summary" == "locked" ]]; then
+    printf 'arm joints already locked\n'
+    return 0
+  fi
+  api_request_friendly "arm joints locked" POST /api/arm/joints:lock
+}
+
+arm_unlock_action() {
+  local joints summary
+  joints="$(api_request GET /api/arm/joints)"
+  summary="$(arm_brake_summary "$joints")"
+  if [[ "$summary" == "unlocked" ]]; then
+    printf 'arm joints already unlocked\n'
+    return 0
+  fi
+  ensure_control_token_for_action "unlock arm joints" || return 1
+  api_request_friendly "arm joints unlocked" POST /api/arm/joints:unlock
+}
+
+end_effector_power_action() {
+  local desired="$1" action="$2" message="$3" endpoint="$4" state current
+  state="$(api_request GET /api/end-effector/power)"
+  current="$(printf '%s' "$state" | extract_json_string status || true)"
+  if [[ "$current" == "$desired" ]]; then
+    printf 'end effector already %s\n' "$(printf '%s' "$desired" | tr '[:upper:]' '[:lower:]')"
+    return 0
+  fi
+  ensure_control_token_for_action "$action" || return 1
+  api_request_friendly "$message" POST "$endpoint"
+}
+
+fci_action() {
+  local desired="$1" action="$2" message="$3" endpoint="$4" state current
+  state="$(api_request GET /api/fci)"
+  current="$(printf '%s' "$state" | extract_json_string status || true)"
+  if [[ "$current" == "$desired" ]]; then
+    printf 'FCI already %s\n' "$(printf '%s' "$desired" | tr '[:upper:]' '[:lower:]')"
+    return 0
+  fi
+  ensure_control_token_for_action "$action" || return 1
+  api_request_friendly "$message" POST "$endpoint"
+}
+
+workflow_on() {
+  [[ "$#" -eq 0 ]] || die "on does not accept arguments"
+  printf 'turning robot on for FCI\n'
+  arm_unlock_action
+  fci_action Active "activate FCI" "FCI activated" /api/fci:activate
+}
+
+workflow_lock() {
+  local fci_status=0 lock_status=0
+  [[ "$#" -eq 0 ]] || die "lock does not accept arguments"
+  printf 'locking robot\n'
+  if fci_action Inactive "deactivate FCI" "FCI deactivated" /api/fci:deactivate; then
+    fci_status=0
+  else
+    fci_status=$?
+    printf 'continuing to lock arm\n' >&2
+  fi
+  if arm_lock_action; then
+    lock_status=0
+  else
+    lock_status=$?
+  fi
+  [[ "$lock_status" -eq 0 ]] || return "$lock_status"
+  return "$fci_status"
+}
+
+parse_body_option() {
+  local default="${1-}"
+  [[ -n "$default" ]] || default="{}"
+  shift || true
+  BODY="$default"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --body) BODY="$(read_body "$2")"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+}
+
+parse_file_or_body_options() {
+  BODY=""
+  FILE=""
+  CONTENT_TYPE="application/octet-stream"
+  OUTPUT=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --body) BODY="$(read_body "$2")"; shift 2 ;;
+      --file) FILE="$2"; shift 2 ;;
+      --content-type) CONTENT_TYPE="$2"; shift 2 ;;
+      --output) OUTPUT="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$BODY" && -n "$FILE" ]] && die "use either --body or --file, not both"
+  return 0
+}
+
+parse_output_option() {
+  OUTPUT=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output) OUTPUT="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+}
+
+endpoint_no_body() {
+  [[ $# -eq 2 ]] || die "internal endpoint_no_body usage error"
+  api_request "$1" "$2"
+}
+
+endpoint_with_body() {
+  local method="$1" path="$2"
+  shift 2
+  parse_body_option "{}" "$@"
+  api_request "$method" "$path" "$BODY"
+}
+
+endpoint_type_body() {
+  local method="$1" path="$2" type=""
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type) type="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$type" ]] || die "--type is required"
+  api_request "$method" "$path" "{\"type\":\"$(json_escape "$type")\"}"
+}
+
+handle_system() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    ""|-h|--help|help) usage_system ;;
+    state) api_request_read format_system_state GET /api/system ;;
+    watch) api_sse /api/system/sse ;;
+    operating-mode) api_request_read format_operating_mode GET /api/system/operating-mode ;;
+    operating-mode-change)
+      parse_body_option "{}" "$@"
+      api_request_spoc_friendly "change operating mode" "operating mode change requested" POST /api/system/operating-mode:change "$BODY"
+      ;;
+    software) api_request_read format_software GET /api/system/software ;;
+    software-status-token) endpoint_no_body GET /api/system/software/status-token ;;
+    updates) api_request_read format_updates GET /api/system/software/update ;;
+    updates-reset) api_request_friendly "pending software update state reset" DELETE /api/system/software/update ;;
+    updates-prepare-online)
+      parse_body_option "{}" "$@"
+      api_request_friendly "online update preparation requested" POST /api/system/software/update:prepare-online "$BODY"
+      ;;
+    updates-prepare-offline)
+      parse_file_or_body_options "$@"
+      api_request_friendly "offline update preparation requested" POST /api/system/software/update:prepare-offline "$BODY" "$FILE" "$CONTENT_TYPE" "$OUTPUT"
+      ;;
+    updates-apply)
+      parse_body_option "{}" "$@"
+      api_request_friendly "pending software updates apply requested" POST /api/system/software/update:apply "$BODY"
+      ;;
+    log) parse_output_option "$@"; api_request GET /api/system/log "" "" application/octet-stream "$OUTPUT" ;;
+    public-cyclic-log) endpoint_no_body GET /api/system/log/public/cyclic ;;
+    public-event-log) endpoint_no_body GET /api/system/log/public/events ;;
+    shutdown) parse_yes_option "$@"; confirm_destructive_action "shutdown" "$YES"; api_request_friendly "shutdown requested" POST /api/system:shutdown ;;
+    reboot) parse_yes_option "$@"; confirm_destructive_action "reboot" "$YES"; api_request_friendly "reboot requested" POST /api/system:reboot ;;
+    *) die "unknown system command: ${sub:-<missing>}" ;;
+  esac
+}
+
+handle_control() {
+  local sub="${1:-}"; shift || true
+  local result token token_id owner explicit_body take_timeout request_transfer show_token state current_owner current_token_id saved_token_id
+  case "$sub" in
+    ""|-h|--help|help) usage_control ;;
+    state) api_request_read format_control_state GET /api/system/control-token ;;
+    take)
+      owner="$(default_owner)"
+      explicit_body=""
+      take_timeout="$CONTROL_TAKE_TIMEOUT"
+      request_transfer=0
+      show_token=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --owner) owner="$2"; shift 2 ;;
+          --wait) take_timeout="$2"; shift 2 ;;
+          --request) request_transfer=1; shift ;;
+          --show-token) show_token=1; shift ;;
+          --body) explicit_body="$(read_body "$2")"; shift 2 ;;
+          *) die "unknown option: $1" ;;
+        esac
+      done
+      if [[ -z "$explicit_body" && "$DRY_RUN" -eq 0 ]]; then
+        state="$(get_control_state)"
+        current_owner="$(printf '%s' "$state" | extract_json_string owner || true)"
+        current_token_id="$(printf '%s' "$state" | extract_token_id || true)"
+        if [[ -n "$current_owner" ]]; then
+          if [[ "$current_owner" == "$owner" ]]; then
+            saved_token_id=""
+            [[ "$CONTROL_TOKEN_FROM_USER" -eq 0 ]] && saved_token_id="$(load_token_id || true)"
+            if [[ -n "$CONTROL_TOKEN" && "$CONTROL_TOKEN_FROM_USER" -eq 1 ]]; then
+              print_owner_message "control token already owned by " "$current_owner" "$current_token_id"
+              printf 'using provided control token\n' >&2
+              print_control_token_result "$CONTROL_TOKEN" "$current_token_id" "control token available from provided token" "$show_token"
+              return 0
+            fi
+            if [[ -n "$CONTROL_TOKEN" && -n "$saved_token_id" && "$saved_token_id" == "$current_token_id" ]]; then
+              print_owner_message "control token already owned by " "$current_owner" "$current_token_id"
+              printf 'using saved control token: %s\n' "$TOKEN_FILE" >&2
+              print_control_token_result "$CONTROL_TOKEN" "$current_token_id" "control token already saved" "$show_token"
+              return 0
+            fi
+            if [[ -n "$CONTROL_TOKEN" && -z "$saved_token_id" ]]; then
+              [[ -n "$current_token_id" ]] && save_token "$CONTROL_TOKEN" "$current_token_id"
+              print_owner_message "control token already owned by " "$current_owner" "$current_token_id"
+              printf 'using saved control token: %s\n' "$TOKEN_FILE" >&2
+              print_control_token_result "$CONTROL_TOKEN" "$current_token_id" "control token already saved" "$show_token"
+              return 0
+            fi
+            print_owner_message "control token already owned by " "$current_owner" "$current_token_id"
+            if [[ -n "$CONTROL_TOKEN" ]]; then
+              printf 'local token exists at %s, but its tokenId is not recorded or does not match; try the existing token or release control from Desk\n' "$TOKEN_FILE" >&2
+            else
+              printf 'no local token is available; release control from Desk, then run control take again\n' >&2
+            fi
+            return 1
+          fi
+          print_owner_message "control token already owned by " "$current_owner" "$current_token_id"
+          if [[ "$request_transfer" -eq 0 ]]; then
+            printf 'use: franka control take --request --wait SECONDS\n' >&2
+            return 1
+          fi
+          printf 'requesting control transfer for owner %s\n' "$owner" >&2
+        fi
+      fi
+      if [[ -n "$explicit_body" ]]; then
+        BODY="$explicit_body"
+      elif [[ "$take_timeout" == "none" ]]; then
+        BODY="{\"owner\":\"$(json_escape "$owner")\"}"
+      else
+        require_positive_json_number "$take_timeout" "--wait"
+        BODY="{\"owner\":\"$(json_escape "$owner")\",\"timeout\":$take_timeout}"
+      fi
+      result="$(api_request POST /api/system/control-token:take "$BODY" "" "application/octet-stream" "" 0)"
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf '%s\n' "$result"
+      fi
+      [[ "$DRY_RUN" -eq 1 ]] && return 0
+      token="$(printf '%s' "$result" | extract_token || true)"
+      token_id="$(printf '%s' "$result" | extract_token_id || true)"
+      if [[ -n "$token" ]]; then
+        save_token "$token" "$token_id"
+        printf 'saved control token: %s\n' "$TOKEN_FILE" >&2
+        print_control_token_result "$token" "$token_id" "control token saved" "$show_token"
+      else
+        printf 'warning: could not identify token field in response; pass --control-token manually\n' >&2
+      fi
+      ;;
+    release)
+      if api_request_spoc_friendly "release control token" "control token released" POST /api/system/control-token:release; then
+        if [[ "$DRY_RUN" -eq 0 ]]; then
+          delete_token
+        fi
+      fi
+      ;;
+    *) die "unknown control command: ${sub:-<missing>}" ;;
+  esac
+}
+
+handle_arm() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    ""|-h|--help|help) usage_arm ;;
+    info) api_request_read format_arm_info GET /api/arm ;;
+    joints) api_request_read format_arm_joints GET /api/arm/joints ;;
+    warnings) api_request_read format_arm_warnings GET /api/arm/warnings ;;
+    lock) arm_lock_action ;;
+    unlock) arm_unlock_action ;;
+    motion-start)
+      parse_body_option "{}" "$@"
+      api_request_spoc_friendly "start arm motion" "arm motion finished" POST /api/arm/motion:start "$BODY"
+      ;;
+    motion-stop) api_request_friendly "arm motion stop requested" POST /api/arm/motion:stop ;;
+    *) die "unknown arm command: ${sub:-<missing>}" ;;
+  esac
+}
+
+handle_end_effector() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    ""|-h|--help|help) usage_end_effector ;;
+    power) api_request_read format_end_effector_power GET /api/end-effector/power ;;
+    power-on) end_effector_power_action On "power on end effector" "end effector powered on" /api/end-effector/power:on ;;
+    power-off) end_effector_power_action Off "power off end effector" "end effector powered off" /api/end-effector/power:off ;;
+    *) die "unknown end-effector command: ${sub:-<missing>}" ;;
+  esac
+}
+
+handle_fci() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    ""|-h|--help|help) usage_fci ;;
+    state) api_request_read format_fci_state GET /api/fci ;;
+    activate) fci_action Active "activate FCI" "FCI activated" /api/fci:activate ;;
+    deactivate) fci_action Inactive "deactivate FCI" "FCI deactivated" /api/fci:deactivate ;;
+    *) die "unknown fci command: ${sub:-<missing>}" ;;
+  esac
+}
+
+handle_config() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    ""|-h|--help|help) usage_config ;;
+    get) api_request_read format_config_summary GET /api/configuration ;;
+    patch)
+      parse_body_option "{}" "$@"
+      api_request_spoc_friendly "patch configuration" "configuration patched" PATCH /api/configuration "$BODY"
+      ;;
+    initial)
+      parse_body_option "{}" "$@"
+      api_request_friendly "initial configuration applied" PUT /api/configuration/initial "$BODY"
+      ;;
+    arm-mounting) api_request_read format_arm_mounting GET /api/configuration/arm-mounting ;;
+    arm-mounting-set)
+      parse_body_option "{}" "$@"
+      api_request_spoc_friendly "update arm mounting state" "arm mounting state updated" PUT /api/configuration/arm-mounting "$BODY"
+      ;;
+    *) die "unknown config command: ${sub:-<missing>}" ;;
+  esac
+}
+
+handle_safety() {
+  local sub="${1:-}"; shift || true
+  local token token_key body type
+  case "$sub" in
+    ""|-h|--help|help) usage_safety ;;
+    self-tests) api_request_read format_self_tests GET /api/safety/self-tests ;;
+    execute-self-tests) api_request_spoc_friendly "execute self-tests" "self-tests execution requested" POST /api/safety/self-tests:execute ;;
+    log) parse_output_option "$@"; api_request GET /api/safety/log "" "" application/octet-stream "$OUTPUT" ;;
+    configuration-apply)
+      parse_file_or_body_options "$@"
+      api_request_spoc_friendly "apply safety configuration" "safety configuration applied" POST /api/safety/configuration:apply "$BODY" "$FILE" "$CONTENT_TYPE" "$OUTPUT"
+      ;;
+    recovery) api_request_read format_recovery GET /api/safety/recovery ;;
+    recovery-start)
+      type=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --type) type="$2"; shift 2 ;;
+          *) die "unknown option: $1" ;;
+        esac
+      done
+      [[ -n "${type:-}" ]] || die "--type is required"
+      api_request_spoc_friendly "start safety recovery" "safety recovery started" POST /api/safety/recovery:start "{\"type\":\"$(json_escape "$type")\"}"
+      ;;
+    recovery-confirm)
+      type=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --type) type="$2"; shift 2 ;;
+          *) die "unknown option: $1" ;;
+        esac
+      done
+      [[ -n "${type:-}" ]] || die "--type is required"
+      api_request_spoc_friendly "confirm safety recovery" "safety recovery confirmed" POST /api/safety/recovery:confirm "{\"type\":\"$(json_escape "$type")\"}"
+      ;;
+    joint-motion-start)
+      parse_body_option "{}" "$@"
+      api_request_spoc_friendly "start joint recovery motion" "joint recovery motion started" POST /api/safety/recovery/joint-motion:start "$BODY"
+      ;;
+    joint-motion-continue)
+      token=""
+      token_key="continuationToken"
+      body=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --body) body="$(read_body "$2")"; shift 2 ;;
+          --token) token="$2"; shift 2 ;;
+          --token-key) token_key="$2"; shift 2 ;;
+          *) die "unknown option: $1" ;;
+        esac
+      done
+      [[ -n "$body" && -n "$token" ]] && die "use either --body or --token, not both"
+      [[ -n "$body" || -n "$token" ]] || die "provide --body or --token"
+      if [[ -z "$body" ]]; then
+        body="{\"$(json_escape "$token_key")\":\"$(json_escape "$token")\"}"
+      fi
+      api_request_spoc_friendly "continue joint recovery motion" "joint recovery motion completed" POST /api/safety/recovery/joint-motion:continue "$body"
+      ;;
+    joint-motion-stop) api_request_spoc_friendly "stop joint recovery motion" "joint recovery motion stopped" POST /api/safety/recovery/joint-motion:stop ;;
+    *) die "unknown safety command: ${sub:-<missing>}" ;;
+  esac
+}
+
+handle_raw() {
+  local method="${1:-}" path="${2:-}"
+  if [[ "$method" == "-h" || "$method" == "--help" || "$method" == "help" || -z "$method" ]]; then
+    usage_raw
+    return 0
+  fi
+  [[ -n "$method" && -n "$path" ]] || die "usage: franka raw METHOD PATH [--body JSON|@file|-] [--file FILE] [--content-type TYPE] [--output FILE]"
+  shift 2
+  parse_file_or_body_options "$@"
+  api_request "$method" "$path" "$BODY" "$FILE" "$CONTENT_TYPE" "$OUTPUT"
+}
+
+print_bash_completion() {
+  cat <<'EOF'
+# Bash completion for franka.
+# Generated by: franka completion bash
+
+_franka_complete()
+{
+  local cur prev words cword
+  _init_completion -n : 2>/dev/null || {
+    COMPREPLY=()
+    words=("${COMP_WORDS[@]}")
+    cword=$COMP_CWORD
+    cur="${words[cword]}"
+    prev="${words[cword-1]}"
+  }
+
+  local global_opts groups commands opts methods paths
+  global_opts="--host -u --username -p --password --control-token --token-file --no-token-file --timeout --insecure --secure -v --verbose --dry-run --json -h --help"
+  groups="setup status doctor on lock completion system control arm end-effector ee fci config safety raw"
+  methods="GET POST PUT PATCH DELETE"
+  paths="/api/system /api/system/control-token /api/system/control-token:take /api/system/control-token:release /api/system/operating-mode /api/system/operating-mode:change /api/system/software /api/system/software/update /api/system/log /api/arm /api/arm/joints /api/arm/joints:lock /api/arm/joints:unlock /api/arm/motion:start /api/arm/motion:stop /api/end-effector/power /api/end-effector/power:on /api/end-effector/power:off /api/fci /api/fci:activate /api/fci:deactivate /api/configuration /api/configuration/initial /api/configuration/arm-mounting /api/safety/self-tests /api/safety/self-tests:execute /api/safety/recovery /api/safety/recovery:start /api/safety/recovery:confirm /api/safety/recovery/joint-motion:start /api/safety/recovery/joint-motion:continue /api/safety/recovery/joint-motion:stop"
+
+  case "$prev" in
+    --host|--username|-u|--password|-p|--control-token|--token-file|--timeout|--control-take-timeout|--owner|--wait|--type|--token|--token-key|--content-type|--output)
+      COMPREPLY=()
+      return 0
+      ;;
+    --body)
+      COMPREPLY=( $(compgen -f -- "$cur") )
+      return 0
+      ;;
+    --file)
+      COMPREPLY=( $(compgen -f -- "$cur") )
+      return 0
+      ;;
+  esac
+
+  local group="" group_index=0 i word
+  for ((i=1; i<cword; i++)); do
+    word="${words[i]}"
+    case "$word" in
+      --host|--username|-u|--password|-p|--control-token|--token-file|--timeout)
+        ((i++))
+        continue
+        ;;
+      --no-token-file|--insecure|--secure|-v|--verbose|--dry-run|--json|-h|--help)
+        continue
+        ;;
+      *)
+        group="$word"
+        group_index=$i
+        break
+        ;;
+    esac
+  done
+
+  if [[ -z "$group" ]]; then
+    COMPREPLY=( $(compgen -W "$global_opts $groups" -- "$cur") )
+    return 0
+  fi
+
+  if (( cword == group_index + 1 )); then
+    case "$group" in
+      status|doctor|on|lock)
+        COMPREPLY=()
+        ;;
+      setup)
+        commands="--host -u --username -p --password --token-file --timeout --control-take-timeout --insecure --secure --show --reset -h --help"
+        COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+        ;;
+      completion)
+        COMPREPLY=( $(compgen -W "bash" -- "$cur") )
+        ;;
+      system)
+        commands="state watch operating-mode operating-mode-change software software-status-token updates updates-reset updates-prepare-online updates-prepare-offline updates-apply log public-cyclic-log public-event-log shutdown reboot"
+        COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+        ;;
+      control)
+        commands="state take release"
+        COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+        ;;
+      arm)
+        commands="info joints warnings lock unlock motion-start motion-stop"
+        COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+        ;;
+      end-effector|ee)
+        commands="power power-on power-off"
+        COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+        ;;
+      fci)
+        commands="state activate deactivate"
+        COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+        ;;
+      config)
+        commands="get patch initial arm-mounting arm-mounting-set"
+        COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+        ;;
+      safety)
+        commands="self-tests execute-self-tests log configuration-apply recovery recovery-start recovery-confirm joint-motion-start joint-motion-continue joint-motion-stop"
+        COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+        ;;
+      raw)
+        COMPREPLY=( $(compgen -W "$methods" -- "$cur") )
+        ;;
+      *)
+        COMPREPLY=()
+        ;;
+    esac
+    return 0
+  fi
+
+  local cmd="${words[group_index+1]}"
+  case "$group:$cmd" in
+    completion:bash|status:*|doctor:*|on:*|lock:*)
+      opts=""
+      ;;
+    setup:*)
+      opts="--host -u --username -p --password --token-file --timeout --control-take-timeout --insecure --secure --show --reset -h --help"
+      ;;
+    system:operating-mode-change|system:updates-prepare-online|system:updates-apply|arm:motion-start|config:patch|config:initial|config:arm-mounting-set|safety:joint-motion-start)
+      opts="--body"
+      ;;
+    system:updates-prepare-offline|safety:configuration-apply)
+      opts="--body --file --content-type --output"
+      ;;
+    system:log|safety:log)
+      opts="--output"
+      ;;
+    system:shutdown|system:reboot)
+      opts="--yes -y"
+      ;;
+    control:take)
+      opts="--owner --wait --request --show-token --body"
+      ;;
+    safety:recovery-start|safety:recovery-confirm)
+      opts="--type"
+      ;;
+    safety:joint-motion-continue)
+      opts="--body --token --token-key"
+      ;;
+    raw:GET|raw:POST|raw:PUT|raw:PATCH|raw:DELETE)
+      if (( cword == group_index + 2 )); then
+        COMPREPLY=( $(compgen -W "$paths" -- "$cur") )
+        return 0
+      fi
+      opts="--body --file --content-type --output"
+      ;;
+    raw:*)
+      if (( cword == group_index + 2 )); then
+        COMPREPLY=( $(compgen -W "$methods" -- "$cur") )
+        return 0
+      fi
+      opts="--body --file --content-type --output"
+      ;;
+    *)
+      opts=""
+      ;;
+  esac
+
+  if [[ "$cur" == -* ]]; then
+    COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+  else
+    COMPREPLY=()
+  fi
+}
+
+complete -F _franka_complete franka
+EOF
+}
+
+handle_completion() {
+  local shell="${1:-}"
+  case "$shell" in
+    ""|-h|--help|help) usage_completion ;;
+    bash) print_bash_completion ;;
+    *) die "unknown completion shell: $shell" ;;
+  esac
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host) HOST="$2"; shift 2 ;;
+    -u|--username) USERNAME="$2"; shift 2 ;;
+    -p|--password) PASSWORD="$2"; shift 2 ;;
+    --control-token) CONTROL_TOKEN="$2"; CONTROL_TOKEN_FROM_USER=1; shift 2 ;;
+    --token-file) TOKEN_FILE="$2"; shift 2 ;;
+    --no-token-file) NO_TOKEN_FILE=1; shift ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    --insecure) INSECURE=1; shift ;;
+    --secure) INSECURE=0; shift ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --json) JSON_OUTPUT=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown global option: $1" ;;
+    *) break ;;
+  esac
+done
+
+[[ $# -gt 0 ]] || {
+  usage
+  exit 2
+}
+
+load_token
+
+group="$1"
+shift
+case "$group" in
+  setup) handle_setup "$@" ;;
+  status|doctor) handle_status "$@" ;;
+  on) workflow_on "$@" ;;
+  lock) workflow_lock "$@" ;;
+  completion) handle_completion "$@" ;;
+  system) handle_system "$@" ;;
+  control) handle_control "$@" ;;
+  arm) handle_arm "$@" ;;
+  end-effector|ee) handle_end_effector "$@" ;;
+  fci) handle_fci "$@" ;;
+  config) handle_config "$@" ;;
+  safety) handle_safety "$@" ;;
+  raw) handle_raw "$@" ;;
+  *) die "unknown group: $group" ;;
+esac
