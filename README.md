@@ -17,7 +17,8 @@ request/response behavior.
 
 - `bash`
 - `curl`
-- standard Unix tools: `sed`, `tr`, `grep`, `paste`, `mktemp`
+- standard Unix tools: `sed`, `tr`, `grep`, `paste`, `mktemp`, `od`, `base64`
+- `openssl` for Desk session authentication used by private Desk UI endpoints
 
 No Python, Node, package install, or virtual environment is required.
 
@@ -132,8 +133,10 @@ franka system state
 franka status
 
 # Convenience workflows
-franka on      # unlock arm if needed, then activate FCI
-franka lock    # deactivate FCI if needed, then lock arm
+franka on         # unlock arm if needed, then activate FCI
+franka free       # enter Desk Programming mode for hand-guiding
+franka execution  # switch Desk operating mode back to Execution
+franka lock       # deactivate FCI if needed, then lock arm
 
 # Watch system state over server-sent events
 franka system watch
@@ -217,6 +220,31 @@ API `owner`. If another owner already holds the token, `control take` reports
 the current owner and exits without waiting; use `--request --wait SECONDS` to
 request a transfer and wait longer. The SPoC token from `control take` is saved under
 `~/.config/franka-deskapi/control-token` and reused automatically.
+
+## Hand-Guiding
+
+To prepare the API-controlled part of manual guiding:
+
+```sh
+./franka free
+```
+
+`franka free` takes or reuses SPoC control, unlocks the arm joints, switches
+Desk operating mode to `Programming`, and then sets Desk's hand-guiding mode to
+`free`. If another user owns control, request a transfer:
+
+```sh
+./franka free --request --wait 30
+```
+
+After the command succeeds, use the required physical enabling device and hold
+the Enabling and Guiding Buttons on the Pilot-Grip.
+
+To leave the white programming/guiding state and return to Execution mode:
+
+```sh
+./franka execution
+```
 
 ## SPoC Control Token
 

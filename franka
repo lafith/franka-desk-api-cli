@@ -101,6 +101,8 @@ Groups:
   status          Summarize robot, control token, arm, FCI, and safety state
   doctor          Alias for status
   on              Unlock arm if needed, then activate FCI
+  free            Enter Desk Programming mode for hand-guiding
+  execution       Switch Desk operating mode back to Execution
   lock            Deactivate FCI if needed, then lock arm
   completion      Generate shell completion
   system          System state, software, logs, reboot, shutdown
@@ -118,6 +120,8 @@ Examples:
   ./franka system state
   ./franka status
   ./franka on
+  ./franka free
+  ./franka execution
   ./franka lock
   ./franka completion bash
   ./franka control take
@@ -351,7 +355,10 @@ load_token() {
 save_token() {
   local token="$1"
   local token_id="${2:-}"
-  [[ "$NO_TOKEN_FILE" -eq 1 || -z "$token" ]] && return 0
+  [[ -z "$token" ]] && return 0
+  CONTROL_TOKEN="$token"
+  CONTROL_TOKEN_FROM_USER=0
+  [[ "$NO_TOKEN_FILE" -eq 1 ]] && return 0
   mkdir -p "$(dirname "$TOKEN_FILE")"
   umask 077
   printf '%s\n' "$token" > "$TOKEN_FILE"
@@ -719,6 +726,198 @@ curl_common_args() {
   [[ -n "$USERNAME" && -n "$PASSWORD" ]] && CURL_ARGS+=(-u "$USERNAME:$PASSWORD")
   [[ "$include_control_token" -eq 1 && -n "$CONTROL_TOKEN" ]] && CURL_ARGS+=(-H "X-Control-Token: $CONTROL_TOKEN")
   return 0
+}
+
+desk_password_hash() {
+  command -v openssl >/dev/null 2>&1 || die "openssl is required for Desk session login"
+  command -v od >/dev/null 2>&1 || die "od is required for Desk session login"
+  command -v base64 >/dev/null 2>&1 || die "base64 is required for Desk session login"
+  printf '%s' "${PASSWORD}#${USERNAME}@franka" |
+    openssl dgst -sha256 -binary |
+    od -An -t u1 -v |
+    tr -s '[:space:]' ',' |
+    sed 's/^,//;s/,$//' |
+    base64 |
+    tr -d '\r\n'
+}
+
+desk_login() {
+  local password_hash body body_file status url
+  normalize_host
+  url="$HOST/admin/api/login"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'METHOD POST\n'
+    printf 'URL %s\n' "$url"
+    [[ "$INSECURE" -eq 1 ]] && printf 'TLS verify disabled\n'
+    [[ "$INSECURE" -eq 0 ]] && printf 'TLS verify enabled\n'
+    printf 'AUTH Desk username=%s password=<redacted>\n' "$USERNAME"
+    printf 'HEADER Content-Type: application/json\n'
+    printf 'BODY {"login":"%s","password":"<redacted>"}\n' "$(json_escape "$USERNAME")"
+    printf '%s\n' "<desk-session-token>"
+    return 0
+  fi
+
+  password_hash="$(desk_password_hash)"
+  body="{\"login\":\"$(json_escape "$USERNAME")\",\"password\":\"$(json_escape "$password_hash")\"}"
+  body_file="$(mktemp)"
+  trap 'rm -f "${body_file:-}"; trap - RETURN' RETURN
+
+  CURL_ARGS=(-sS --connect-timeout "$TIMEOUT" -X POST --max-time "$TIMEOUT" -o "$body_file" -w '%{http_code}' -H 'Content-Type: application/json' --data-binary "$body")
+  [[ "$INSECURE" -eq 1 ]] && CURL_ARGS+=(-k)
+
+  status="$(curl "${CURL_ARGS[@]}" "$url")" || {
+    rm -f "$body_file"
+    die "Desk login request failed"
+  }
+
+  if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+    printf 'HTTP %s\n' "$status" >&2
+    cat "$body_file" >&2
+    printf '\n' >&2
+    return 1
+  fi
+
+  tr -d '\r\n' < "$body_file"
+}
+
+desk_request() {
+  local method="$1" path="$2" auth_token="$3" body="${4-}" content_type="${5:-application/json}"
+  local body_file status url
+  normalize_host
+  url="$HOST/desk/api$path"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'METHOD %s\n' "$method"
+    printf 'URL %s\n' "$url"
+    [[ "$INSECURE" -eq 1 ]] && printf 'TLS verify disabled\n'
+    [[ "$INSECURE" -eq 0 ]] && printf 'TLS verify enabled\n'
+    printf 'COOKIE authorization=<redacted>\n'
+    [[ -n "$CONTROL_TOKEN" ]] && printf 'HEADER X-Control-Token: <redacted>\n'
+    if [[ -n "$body" ]]; then
+      printf 'HEADER Content-Type: %s\n' "$content_type"
+      printf 'BODY %s\n' "$body"
+    fi
+    return 0
+  fi
+
+  body_file="$(mktemp)"
+  trap 'rm -f "${body_file:-}"; trap - RETURN' RETURN
+
+  CURL_ARGS=(-sS --connect-timeout "$TIMEOUT" -X "$method" --max-time "$TIMEOUT" -o "$body_file" -w '%{http_code}' -H "Cookie: authorization=$auth_token")
+  [[ "$INSECURE" -eq 1 ]] && CURL_ARGS+=(-k)
+  [[ -n "$CONTROL_TOKEN" ]] && CURL_ARGS+=(-H "X-Control-Token: $CONTROL_TOKEN")
+  if [[ -n "$body" ]]; then
+    CURL_ARGS+=(-H "Content-Type: $content_type" --data-binary "$body")
+  fi
+
+  status="$(curl "${CURL_ARGS[@]}" "$url")" || {
+    rm -f "$body_file"
+    die "Desk private API request failed"
+  }
+
+  if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+    printf 'HTTP %s\n' "$status" >&2
+    cat "$body_file" >&2
+    printf '\n' >&2
+    return 1
+  fi
+
+  if [[ -s "$body_file" ]]; then
+    cat "$body_file"
+    printf '\n'
+  else
+    printf '%s\n' "$status"
+  fi
+}
+
+current_operating_mode() {
+  local state
+  state="$(api_request GET /api/system/operating-mode)" || return 1
+  printf '%s' "$state" | extract_json_string status || true
+}
+
+wait_operating_mode() {
+  local desired="$1" timeout="${2:-10}" mode i
+  for ((i=0; i<=timeout; i++)); do
+    mode="$(current_operating_mode || true)"
+    if [[ "$mode" == "$desired" ]]; then
+      printf 'operating mode: %s\n' "$mode"
+      return 0
+    fi
+    [[ "$i" -lt "$timeout" ]] && sleep 1
+  done
+
+  printf 'timed out waiting for operating mode %s' "$desired" >&2
+  [[ -n "$mode" ]] && printf ' (current: %s)' "$mode" >&2
+  printf '\n' >&2
+  return 1
+}
+
+desk_switch_operating_mode() {
+  local desk_mode="$1" expected auth_token mode
+  case "$desk_mode" in
+    programming) expected="Programming" ;;
+    execution) expected="Execution" ;;
+    *) die "unknown Desk operating mode: $desk_mode" ;;
+  esac
+  ensure_control_token_for_action "switch Desk operating mode to $desk_mode" || return 1
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    desk_login
+    auth_token="<desk-session-token>"
+    desk_request POST "/operating-mode/$desk_mode" "$auth_token"
+    api_request GET /api/system/operating-mode
+    return 0
+  fi
+
+  mode="$(current_operating_mode || true)"
+  if [[ "$mode" == "$expected" ]]; then
+    printf 'operating mode already %s\n' "$mode"
+    return 0
+  fi
+
+  auth_token="$(desk_login)" || return 1
+  desk_request POST "/operating-mode/$desk_mode" "$auth_token" >/dev/null || return 1
+  wait_operating_mode "$expected" 10
+}
+
+desk_guiding_mode_label() {
+  case "$1" in
+    0) printf 'translation' ;;
+    1) printf 'rotation' ;;
+    2) printf 'free' ;;
+    3) printf 'user' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+desk_set_guiding_mode() {
+  local mode="$1" auth_token result current_mode label
+  case "$mode" in
+    translation|rotation|free|user) ;;
+    *) die "unknown guiding mode: $mode" ;;
+  esac
+  ensure_control_token_for_action "set guiding mode" || return 1
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    desk_login
+    auth_token="<desk-session-token>"
+    desk_request PUT /robot/guiding/mode "$auth_token" "mode=%22${mode}%22" "application/x-www-form-urlencoded"
+    desk_request GET /robot/guiding/mode "$auth_token"
+    return 0
+  fi
+
+  auth_token="$(desk_login)" || return 1
+  desk_request PUT /robot/guiding/mode "$auth_token" "mode=%22${mode}%22" "application/x-www-form-urlencoded" >/dev/null || return 1
+  result="$(desk_request GET /robot/guiding/mode "$auth_token")" || return 1
+  current_mode="$(printf '%s' "$result" | extract_json_number currentMode || true)"
+  label="$(desk_guiding_mode_label "$current_mode")"
+  if [[ "$label" == "$mode" ]]; then
+    printf 'guiding mode: %s\n' "$label"
+  else
+    printf 'guiding mode requested: %s; reported: %s\n' "$mode" "$label"
+  fi
 }
 
 api_request() {
@@ -1091,6 +1290,78 @@ workflow_on() {
   printf 'turning robot on for FCI\n'
   arm_unlock_action
   fci_action Active "activate FCI" "FCI activated" /api/fci:activate
+}
+
+workflow_free() {
+  local take_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --request) take_args+=("--request"); shift ;;
+      --wait)
+        [[ $# -ge 2 ]] || die "--wait requires a value"
+        take_args+=("--wait" "$2")
+        shift 2
+        ;;
+      -h|--help)
+        cat <<'EOF'
+usage: franka free [options]
+
+Prepare the API-controlled part of manual guiding:
+  1. take or reuse SPoC control
+  2. unlock arm joints
+  3. switch Desk operating mode to Programming
+  4. set Desk hand-guiding mode to free
+
+Options:
+  --request          Request control if another owner holds the token
+  --wait SECONDS     Control-token wait timeout. Use with --request when needed
+
+After this command succeeds, use the required physical enabling device and hold
+the Enabling and Guiding Buttons on the Pilot-Grip.
+EOF
+        return 0
+        ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  printf 'preparing robot for manual guiding\n'
+  handle_control take "${take_args[@]}" || return $?
+  arm_unlock_action || return $?
+  desk_switch_operating_mode programming || return $?
+  desk_set_guiding_mode free || return $?
+  printf 'ready for manual guiding: use the physical enabling device and hold the Enabling and Guiding Buttons on the Pilot-Grip\n'
+}
+
+workflow_execution() {
+  local take_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --request) take_args+=("--request"); shift ;;
+      --wait)
+        [[ $# -ge 2 ]] || die "--wait requires a value"
+        take_args+=("--wait" "$2")
+        shift 2
+        ;;
+      -h|--help)
+        cat <<'EOF'
+usage: franka execution [options]
+
+Switch Desk operating mode back to Execution.
+
+Options:
+  --request          Request control if another owner holds the token
+  --wait SECONDS     Control-token wait timeout. Use with --request when needed
+EOF
+        return 0
+        ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  printf 'switching robot to Execution mode\n'
+  handle_control take "${take_args[@]}" || return $?
+  desk_switch_operating_mode execution || return $?
 }
 
 workflow_lock() {
@@ -1468,7 +1739,7 @@ _franka_complete()
 
   local global_opts groups commands opts methods paths
   global_opts="--host -u --username -p --password --control-token --token-file --no-token-file --timeout --insecure --secure -v --verbose --dry-run --json -h --help"
-  groups="setup status doctor on lock completion system control arm end-effector ee fci config safety raw"
+  groups="setup status doctor on free execution exec lock completion system control arm end-effector ee fci config safety raw"
   methods="GET POST PUT PATCH DELETE"
   paths="/api/system /api/system/control-token /api/system/control-token:take /api/system/control-token:release /api/system/operating-mode /api/system/operating-mode:change /api/system/software /api/system/software/update /api/system/log /api/arm /api/arm/joints /api/arm/joints:lock /api/arm/joints:unlock /api/arm/motion:start /api/arm/motion:stop /api/end-effector/power /api/end-effector/power:on /api/end-effector/power:off /api/fci /api/fci:activate /api/fci:deactivate /api/configuration /api/configuration/initial /api/configuration/arm-mounting /api/safety/self-tests /api/safety/self-tests:execute /api/safety/recovery /api/safety/recovery:start /api/safety/recovery:confirm /api/safety/recovery/joint-motion:start /api/safety/recovery/joint-motion:continue /api/safety/recovery/joint-motion:stop"
 
@@ -1515,6 +1786,9 @@ _franka_complete()
     case "$group" in
       status|doctor|on|lock)
         COMPREPLY=()
+        ;;
+      free|execution|exec)
+        COMPREPLY=( $(compgen -W "--request --wait -h --help" -- "$cur") )
         ;;
       setup)
         commands="--host -u --username -p --password --token-file --timeout --control-take-timeout --insecure --secure --show --reset -h --help"
@@ -1565,6 +1839,9 @@ _franka_complete()
   case "$group:$cmd" in
     completion:bash|status:*|doctor:*|on:*|lock:*)
       opts=""
+      ;;
+    free:*|execution:*|exec:*)
+      opts="--request --wait -h --help"
       ;;
     setup:*)
       opts="--host -u --username -p --password --token-file --timeout --control-take-timeout --insecure --secure --show --reset -h --help"
@@ -1663,6 +1940,8 @@ case "$group" in
   setup) handle_setup "$@" ;;
   status|doctor) handle_status "$@" ;;
   on) workflow_on "$@" ;;
+  free) workflow_free "$@" ;;
+  execution|exec) workflow_execution "$@" ;;
   lock) workflow_lock "$@" ;;
   completion) handle_completion "$@" ;;
   system) handle_system "$@" ;;
