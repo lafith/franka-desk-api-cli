@@ -143,6 +143,8 @@ franka system watch
 
 # Take SPoC control token and save it for later commands.
 # Sends {"owner":"<hostname>","timeout":1} by default. Token value is hidden.
+# If another owner holds control in an interactive shell, prompts before using
+# Desk's enforce flow.
 franka control take
 
 # Show the token only when you explicitly need to copy it elsewhere.
@@ -154,6 +156,12 @@ franka control take --owner robot-nuc
 # Wait longer for another user to grant control, or omit the API timeout.
 franka control take --request --wait 30
 franka control take --request --wait none
+
+# Use the same private Desk UI request/enforce flow as the webapp.
+# This requires Desk username/password setup and may require physical confirmation
+# at the robot.
+franka control request --wait 60
+franka control enforce --wait 60
 
 # Show token state
 franka control state
@@ -217,8 +225,22 @@ robot Desk API:
 If `fci activate` returns `ActionUnavailable` with `BrakesClosed`, run
 `arm unlock` first. By default, `control take` uses the NUC hostname as the Desk
 API `owner`. If another owner already holds the token, `control take` reports
-the current owner and exits without waiting; use `--request --wait SECONDS` to
-request a transfer and wait longer. The SPoC token from `control take` is saved under
+the current owner. In an interactive shell, it asks before using the Desk UI
+enforce flow with a 60 second wait. In non-interactive scripts, it exits and
+prints the explicit request/enforce commands to run. Pass `--request --wait
+SECONDS` to skip the prompt and request a transfer through the documented public
+Desk API instead.
+
+For the same private control-request flow used by the Desk webapp, use
+`franka control request` or `franka control enforce`. These commands log in to
+Desk with the configured username/password, call Desk's private
+`/admin/api/control-token/request` endpoint, and save the returned token. If the
+robot asks for confirmation, press the physical confirmation button at the
+robot. The CLI saves the returned token only after the public SPoC state
+confirms control has transferred. `--wait SECONDS` controls how long to wait for
+that confirmation; `--wait none` waits indefinitely.
+
+The SPoC token from successful control commands is saved under
 `~/.config/franka-deskapi/control-token` and reused automatically.
 
 ## Hand-Guiding
