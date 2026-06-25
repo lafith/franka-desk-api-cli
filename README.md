@@ -231,6 +231,12 @@ prints the explicit request/enforce commands to run. Pass `--request --wait
 SECONDS` to skip the prompt and request a transfer through the documented public
 Desk API instead.
 
+If the robot says control is already owned by this machine's owner name but the
+local token file is missing or stale, `control take` asks before requesting a
+fresh token through the Desk UI enforce flow. The CLI waits for Desk's private
+control state to confirm that the active token ID has changed before saving the
+new local token.
+
 For the same private control-request flow used by the Desk webapp, use
 `franka control request` or `franka control enforce`. These commands log in to
 Desk with the configured username/password, call Desk's private
