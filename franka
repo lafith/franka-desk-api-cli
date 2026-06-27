@@ -394,7 +394,11 @@ save_token() {
   mkdir -p "$(dirname "$TOKEN_FILE")"
   umask 077
   printf '%s\n' "$token" > "$TOKEN_FILE"
-  [[ -n "$token_id" ]] && printf '%s\n' "$token_id" > "$TOKEN_ID_FILE"
+  if [[ -n "$token_id" ]]; then
+    printf '%s\n' "$token_id" > "$TOKEN_ID_FILE"
+  else
+    rm -f "$TOKEN_ID_FILE"
+  fi
   return 0
 }
 
@@ -1768,18 +1772,26 @@ handle_control() {
               print_control_token_result "$CONTROL_TOKEN" "$current_token_id" "control token available from provided token" "$show_token"
               return 0
             fi
-            if [[ -n "$CONTROL_TOKEN" && -n "$saved_token_id" && "$saved_token_id" == "$current_token_id" ]]; then
-              print_owner_message "control token already owned by " "$current_owner" "$current_token_id"
-              printf 'using saved control token: %s\n' "$TOKEN_FILE" >&2
-              print_control_token_result "$CONTROL_TOKEN" "$current_token_id" "control token already saved" "$show_token"
-              return 0
-            fi
-	            if [[ -n "$CONTROL_TOKEN" && -z "$saved_token_id" ]]; then
-	              [[ -n "$current_token_id" ]] && save_token "$CONTROL_TOKEN" "$current_token_id"
-	              print_owner_message "control token already owned by " "$current_owner" "$current_token_id"
-	              printf 'using saved control token: %s\n' "$TOKEN_FILE" >&2
-	              print_control_token_result "$CONTROL_TOKEN" "$current_token_id" "control token already saved" "$show_token"
-	              return 0
+            if [[ -n "$CONTROL_TOKEN" ]]; then
+              if [[ -z "$current_token_id" ]]; then
+                print_owner_message "control token already owned by " "$current_owner" "$current_token_id"
+                printf 'using saved control token: %s\n' "$TOKEN_FILE" >&2
+                print_control_token_result "$CONTROL_TOKEN" "$current_token_id" "control token already saved" "$show_token"
+                return 0
+              fi
+              if [[ -n "$saved_token_id" && "$saved_token_id" == "$current_token_id" ]]; then
+                print_owner_message "control token already owned by " "$current_owner" "$current_token_id"
+                printf 'using saved control token: %s\n' "$TOKEN_FILE" >&2
+                print_control_token_result "$CONTROL_TOKEN" "$current_token_id" "control token already saved" "$show_token"
+                return 0
+              fi
+              if [[ -z "$saved_token_id" ]]; then
+                save_token "$CONTROL_TOKEN" "$current_token_id"
+                print_owner_message "control token already owned by " "$current_owner" "$current_token_id"
+                printf 'using saved control token: %s\n' "$TOKEN_FILE" >&2
+                print_control_token_result "$CONTROL_TOKEN" "$current_token_id" "control token already saved" "$show_token"
+                return 0
+              fi
             fi
             print_owner_message "control token already owned by " "$current_owner" "$current_token_id"
             if [[ -n "$CONTROL_TOKEN" ]]; then
